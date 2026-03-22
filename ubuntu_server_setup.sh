@@ -53,18 +53,38 @@ step()    { echo -e "\n${BOLD}${CYAN}──── $* ────${NC}"; log STE
 die()     { error "$*"; exit 1; }
 
 # ─── Privilege setup ──────────────────────────────────────────────────────────
-# If running as root, 'sudo' is a passthrough. If running as a regular user,
-# keep the sudo token alive so it never expires mid-run.
 setup_privileges() {
     if [[ $EUID -eq 0 ]]; then
-        # Running as root — redefine sudo as a no-op prefix so all sudo calls work natively
+        # Already root — make sudo a transparent passthrough
         sudo() { "$@"; }
         export -f sudo
-    else
-        sudo -v || die "This script requires root or sudo privileges."
+        info "Running as root."
+        return
+    fi
+
+    # Not root — check if user is in the sudo group
+    if groups 2>/dev/null | grep -qw sudo; then
+        echo -e "${YELLOW}[WARN]${NC}  Not running as root, but user '$(whoami)' has sudo access."
+        echo ""
+        read -rp "$(echo -e "${CYAN}Re-run with sudo for best results? [Y/n]:${NC} ")" yn
+        if [[ ! "$yn" =~ ^[Nn]$ ]]; then
+            echo ""
+            info "Re-launching with sudo..."
+            exec sudo bash "$0" "$@"
+        fi
+        # User chose to continue without sudo — keep token alive
+        sudo -v || die "sudo authentication failed."
         ( while true; do sudo -v; sleep 50; done ) &
         SUDO_KEEPALIVE_PID=$!
         trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null; exit' EXIT INT TERM
+    else
+        # Not root and no sudo access at all
+        echo ""
+        error "User '$(whoami)' is not root and has no sudo privileges."
+        echo -e "  Run as root:       ${CYAN}sudo su - && ./$(basename "$0")${NC}"
+        echo -e "  Or grant sudo:     ${CYAN}usermod -aG sudo $(whoami)${NC}  (run as root, then re-login)"
+        echo ""
+        die "Insufficient privileges. Exiting."
     fi
 }
 
@@ -182,6 +202,7 @@ step_configure_ssh() {
     ssh_set_option "PasswordAuthentication" "yes"
     ssh_set_option "PubkeyAuthentication"   "yes"
     ssh_set_option "AuthorizedKeysFile"     ".ssh/authorized_keys"
+    ssh_set_option "UsePAM"                 "yes"
     ssh_set_option "X11Forwarding"          "no"
     ssh_set_option "MaxAuthTries"           "4"
     ssh_set_option "LoginGraceTime"         "30"
@@ -275,13 +296,19 @@ step_create_admin_user() {
         success "Passwordless sudo granted to '$ADMIN_USERNAME'."
     fi
 
-    # Set password interactively
+    # Set password interactively (max 3 attempts)
     echo ""
     warn "Set a password for '$ADMIN_USERNAME' (you will be prompted twice):"
+    local passwd_attempts=0
     until sudo passwd "$ADMIN_USERNAME"; do
-        warn "Password set failed — try again."
+        (( passwd_attempts++ ))
+        if (( passwd_attempts >= 3 )); then
+            warn "Password setup failed after 3 attempts — skipping. Set it manually: passwd $ADMIN_USERNAME"
+            break
+        fi
+        warn "Try again ($passwd_attempts/3)..."
     done
-    success "Password set for '$ADMIN_USERNAME'."
+    (( passwd_attempts < 3 )) && success "Password set for '$ADMIN_USERNAME'."
 
     # Ensure .ssh dir exists for key-based login later
     local ssh_dir="/home/$ADMIN_USERNAME/.ssh"
@@ -305,7 +332,7 @@ step_create_admin_user() {
 
 
 step_setup_static_local_ip() {
-    step "· Configuring static local IP via Netplan"
+    step "7 · Configuring static local IP via Netplan"
 
     local iface
     iface=$(ip route get 1.1.1.1 2>/dev/null \
@@ -348,11 +375,13 @@ network:
 EOF
     sudo chmod 600 "$netplan_file"
 
-    if sudo netplan generate 2>&1; then
+    local netplan_err
+    if netplan_err=$(sudo netplan generate 2>&1); then
         sudo netplan apply
         success "Static IP locked: $current_ip on $iface"
     else
         warn "Netplan config error — removing to avoid breaking network."
+        warn "Error: $netplan_err"
         sudo rm -f "$netplan_file"
     fi
 }
@@ -366,13 +395,6 @@ run_status() {
             echo -e "  ${GREEN}● $2${NC} — active"
         else
             echo -e "  ${RED}✗ $2${NC} — inactive / not installed"
-        fi
-    }
-    check_cmd() {
-        if command -v "$1" &>/dev/null; then
-            echo -e "  ${GREEN}● $2${NC} — installed"
-        else
-            echo -e "  ${YELLOW}○ $2${NC} — not installed"
         fi
     }
 
@@ -468,7 +490,7 @@ print_banner() {
 main() {
     print_banner
 
-    setup_privileges
+    setup_privileges "$@"
 
     # Init log file (works for both root and sudo user after privilege setup)
     touch "$LOG_FILE" 2>/dev/null && chmod 644 "$LOG_FILE" \
@@ -500,4 +522,4 @@ main() {
     esac
 }
 
-main
+main "$@"
